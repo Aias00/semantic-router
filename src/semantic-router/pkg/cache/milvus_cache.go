@@ -1,10 +1,15 @@
+//go:build milvus
+// +build milvus
+
 package cache
 
 import (
 	"context"
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -105,6 +110,19 @@ type MilvusCache struct {
 	missCount           int64
 	lastCleanupTime     *time.Time
 	mu                  sync.RWMutex
+	cleanupStopChan     chan struct{}
+	cleanupWG           sync.WaitGroup
+	batchBuffer         []*CacheEntry
+	batchMu             sync.Mutex
+	batchTimer          *time.Timer
+	writeMetrics        struct {
+		totalWrites     int64
+		batchWrites     int64
+		singleWrites    int64
+		writeErrors     int64
+		avgWriteLatency float64
+		lastWriteTime   time.Time
+	}
 }
 
 // MilvusCacheOptions contains configuration parameters for Milvus cache initialization
@@ -126,7 +144,7 @@ func NewMilvusCache(options MilvusCacheOptions) (*MilvusCache, error) {
 
 	// Load Milvus configuration from file
 	observability.Debugf("MilvusCache: loading config from %s", options.ConfigPath)
-	config, err := loadMilvusConfig(options.ConfigPath)
+	config, err := LoadMilvusConfig(options.ConfigPath)
 	if err != nil {
 		observability.Debugf("MilvusCache: failed to load config: %v", err)
 		return nil, fmt.Errorf("failed to load Milvus config: %w", err)
@@ -151,6 +169,13 @@ func NewMilvusCache(options MilvusCacheOptions) (*MilvusCache, error) {
 		similarityThreshold: options.SimilarityThreshold,
 		ttlSeconds:          options.TTLSeconds,
 		enabled:             options.Enabled,
+		cleanupStopChan:     make(chan struct{}),
+		batchBuffer:         make([]*CacheEntry, 0, config.Performance.Batch.InsertBatchSize),
+	}
+
+	// Initialize batch write timer if batch size > 1
+	if config.Performance.Batch.InsertBatchSize > 1 {
+		cache.startBatchWriter()
 	}
 
 	// Set up the collection for caching
@@ -162,11 +187,17 @@ func NewMilvusCache(options MilvusCacheOptions) (*MilvusCache, error) {
 	}
 	observability.Debugf("MilvusCache: initialization complete")
 
+	// Start TTL cleanup goroutine if enabled
+	if config.DataManagement.TTL.Enabled && options.TTLSeconds > 0 {
+		observability.Debugf("MilvusCache: starting TTL cleanup goroutine (interval: %ds)", config.DataManagement.TTL.CleanupInterval)
+		cache.startTTLCleanup()
+	}
+
 	return cache, nil
 }
 
-// loadMilvusConfig reads and parses the Milvus configuration from file
-func loadMilvusConfig(configPath string) (*MilvusConfig, error) {
+// LoadMilvusConfig reads and parses the Milvus configuration from file
+func LoadMilvusConfig(configPath string) (*MilvusConfig, error) {
 	if configPath == "" {
 		return nil, fmt.Errorf("Milvus config path is required")
 	}
@@ -181,12 +212,138 @@ func loadMilvusConfig(configPath string) (*MilvusConfig, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
+	// Validate configuration
+	if err := validateMilvusConfig(&config); err != nil {
+		return nil, fmt.Errorf("configuration validation failed: %w", err)
+	}
+
 	return &config, nil
+}
+
+// validateMilvusConfig validates the Milvus configuration parameters
+func validateMilvusConfig(config *MilvusConfig) error {
+	// Validate connection settings
+	if config.Connection.Host == "" {
+		return fmt.Errorf("connection host is required")
+	}
+	if config.Connection.Port <= 0 || config.Connection.Port > 65535 {
+		return fmt.Errorf("connection port must be between 1 and 65535")
+	}
+	if config.Connection.Timeout <= 0 {
+		config.Connection.Timeout = 30 // Default timeout
+	}
+
+	// Validate authentication
+	if config.Connection.Auth.Enabled {
+		if config.Connection.Auth.Username == "" {
+			return fmt.Errorf("username is required when authentication is enabled")
+		}
+		if config.Connection.Auth.Password == "" {
+			return fmt.Errorf("password is required when authentication is enabled")
+		}
+	}
+
+	// Validate TLS configuration
+	if config.Connection.TLS.Enabled {
+		if config.Connection.TLS.CertFile == "" || config.Connection.TLS.KeyFile == "" {
+			return fmt.Errorf("both cert_file and key_file are required when TLS is enabled")
+		}
+	}
+
+	// Validate collection settings
+	if config.Collection.Name == "" {
+		config.Collection.Name = "semantic_cache" // Default collection name
+	}
+	if config.Collection.VectorField.Name == "" {
+		config.Collection.VectorField.Name = "embedding" // Default vector field name
+	}
+	if config.Collection.VectorField.Dimension <= 0 {
+		// Will be auto-detected at runtime, but warn if explicitly set to invalid value
+		observability.Warnf("Vector field dimension is invalid (%d), will be auto-detected",
+			config.Collection.VectorField.Dimension)
+	}
+
+	// Validate index configuration
+	if config.Collection.Index.Type == "" {
+		config.Collection.Index.Type = "HNSW" // Default index type
+	}
+	if config.Collection.Index.Params.M <= 0 {
+		config.Collection.Index.Params.M = 16 // Default M parameter
+	}
+	if config.Collection.Index.Params.EfConstruction <= 0 {
+		config.Collection.Index.Params.EfConstruction = 64 // Default efConstruction
+	}
+
+	// Validate search configuration
+	if config.Search.TopK <= 0 {
+		config.Search.TopK = 10 // Default topK
+	}
+	if config.Search.Params.Ef <= 0 {
+		config.Search.Params.Ef = 64 // Default ef
+	}
+	if config.Search.ConsistencyLevel == "" {
+		config.Search.ConsistencyLevel = "Session" // Default consistency level
+	}
+
+	// Validate performance settings
+	if config.Performance.ConnectionPool.MaxConnections <= 0 {
+		config.Performance.ConnectionPool.MaxConnections = 10 // Default max connections
+	}
+	if config.Performance.ConnectionPool.MaxIdleConnections <= 0 {
+		config.Performance.ConnectionPool.MaxIdleConnections = 5 // Default idle connections
+	}
+	if config.Performance.ConnectionPool.AcquireTimeout <= 0 {
+		config.Performance.ConnectionPool.AcquireTimeout = 5 // Default acquire timeout
+	}
+	if config.Performance.Batch.InsertBatchSize <= 0 {
+		config.Performance.Batch.InsertBatchSize = 1000 // Default batch size
+	}
+
+	// Validate TTL settings
+	if config.DataManagement.TTL.CleanupInterval <= 0 {
+		config.DataManagement.TTL.CleanupInterval = 3600 // Default 1 hour
+	}
+	if config.DataManagement.Compaction.Interval <= 0 {
+		config.DataManagement.Compaction.Interval = 86400 // Default 24 hours
+	}
+
+	observability.Debugf("Milvus configuration validated - host=%s:%d, collection=%s, index=%s",
+		config.Connection.Host, config.Connection.Port, config.Collection.Name, config.Collection.Index.Type)
+
+	return nil
+}
+
+// validateRuntimeConfig validates configuration at runtime with embedding model
+func (c *MilvusCache) validateRuntimeConfig() error {
+	// Test embedding generation to ensure model is available
+	testEmbedding, err := candle_binding.GetEmbedding("test", 0)
+	if err != nil {
+		return fmt.Errorf("failed to generate test embedding: %w", err)
+	}
+
+	actualDimension := len(testEmbedding)
+
+	// Log the detected dimension
+	observability.Infof("Detected embedding dimension: %d", actualDimension)
+
+	// Check if configured dimension matches (if explicitly set)
+	if c.config.Collection.VectorField.Dimension > 0 &&
+		c.config.Collection.VectorField.Dimension != actualDimension {
+		observability.Warnf("Configured vector dimension (%d) differs from detected dimension (%d), using detected dimension",
+			c.config.Collection.VectorField.Dimension, actualDimension)
+	}
+
+	return nil
 }
 
 // initializeCollection sets up the Milvus collection and index structures
 func (c *MilvusCache) initializeCollection() error {
 	ctx := context.Background()
+
+	// Validate runtime configuration (including embedding model)
+	if err := c.validateRuntimeConfig(); err != nil {
+		return fmt.Errorf("runtime configuration validation failed: %w", err)
+	}
 
 	// Verify collection existence
 	hasCollection, err := c.client.HasCollection(ctx, c.collectionName)
@@ -335,8 +492,9 @@ func (c *MilvusCache) AddPendingRequest(model string, query string, requestBody 
 		return query, nil
 	}
 
-	// Store incomplete entry for later completion with response
-	result, err := c.addEntry(model, query, requestBody, nil)
+	// For pending entries, we need to store them immediately to ensure they can be found later
+	// This is a special case that bypasses batch writing for correctness
+	result, err := c.addPendingEntry(model, query, requestBody)
 
 	if err != nil {
 		metrics.RecordCacheOperation("milvus", "add_pending", "error", time.Since(start).Seconds())
@@ -345,6 +503,75 @@ func (c *MilvusCache) AddPendingRequest(model string, query string, requestBody 
 	}
 
 	return result, err
+}
+
+// addPendingEntry stores a pending entry that will be completed later
+// This method bypasses batch writing to ensure immediate availability
+func (c *MilvusCache) addPendingEntry(model string, query string, requestBody []byte) (string, error) {
+	// Generate semantic embedding for the query
+	embedding, err := candle_binding.GetEmbedding(query, 0) // Auto-detect dimension
+	if err != nil {
+		return "", fmt.Errorf("failed to generate embedding: %w", err)
+	}
+
+	// Generate unique ID
+	id := fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%s_%s_%d_pending", model, query, time.Now().UnixNano()))))
+
+	// Create context with timeout
+	timeout := time.Duration(c.config.Connection.Timeout) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// Prepare data for insertion
+	ids := []string{id}
+	models := []string{model}
+	queries := []string{query}
+	requestBodies := []string{string(requestBody)}
+	responseBodies := []string{""} // Empty response body for pending entries
+	embeddings := [][]float32{embedding}
+	timestamps := []int64{time.Now().Unix()}
+
+	// Create columns
+	idColumn := entity.NewColumnVarChar("id", ids)
+	modelColumn := entity.NewColumnVarChar("model", models)
+	queryColumn := entity.NewColumnVarChar("query", queries)
+	requestColumn := entity.NewColumnVarChar("request_body", requestBodies)
+	responseColumn := entity.NewColumnVarChar("response_body", responseBodies)
+	embeddingColumn := entity.NewColumnFloatVector(c.config.Collection.VectorField.Name, len(embedding), embeddings)
+	timestampColumn := entity.NewColumnInt64("timestamp", timestamps)
+
+	// Insert the pending entry immediately with retry logic
+	observability.Debugf("MilvusCache.addPendingEntry: inserting pending entry for query '%s'", query)
+
+	insertErr := c.retryOperation(ctx, func() error {
+		_, err := c.client.Insert(ctx, c.collectionName, "", idColumn, modelColumn, queryColumn, requestColumn, responseColumn, embeddingColumn, timestampColumn)
+		return err
+	}, "insert pending entry")
+
+	if insertErr != nil {
+		if c.isContextError(insertErr) {
+			observability.Debugf("MilvusCache.addPendingEntry: insert timeout/cancelled: %v", insertErr)
+		} else {
+			observability.Warnf("MilvusCache.addPendingEntry: insert failed after retries: %v", insertErr)
+		}
+		return "", fmt.Errorf("failed to insert pending entry: %w", insertErr)
+	}
+
+	// Flush to ensure persistence
+	flushCtx, flushCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer flushCancel()
+
+	if err := c.client.Flush(flushCtx, c.collectionName, false); err != nil {
+		if !c.isContextError(err) {
+			observability.Warnf("Failed to flush pending entry: %v", err)
+		}
+	}
+
+	observability.Debugf("MilvusCache.addPendingEntry: successfully stored pending entry")
+	return query, nil
 }
 
 // UpdateWithResponse completes a pending request by adding the response
@@ -382,7 +609,8 @@ func (c *MilvusCache) UpdateWithResponse(query string, responseBody []byte) erro
 	if len(results) == 0 {
 		observability.Debugf("MilvusCache.UpdateWithResponse: no pending entry found, adding as new complete entry")
 		// Create new complete entry when no pending entry exists
-		_, err := c.addEntry("unknown", query, []byte(""), responseBody)
+		// Use AddEntry to leverage batch writing if enabled
+		err := c.AddEntry("unknown", query, []byte(""), responseBody)
 		if err != nil {
 			metrics.RecordCacheOperation("milvus", "update_response", "error", time.Since(start).Seconds())
 		} else {
@@ -423,11 +651,43 @@ func (c *MilvusCache) AddEntry(model string, query string, requestBody, response
 		return nil
 	}
 
-	_, err := c.addEntry(model, query, requestBody, responseBody)
+	// Check if batch writing is enabled and appropriate
+	if c.config.Performance.Batch.InsertBatchSize > 1 {
+		// Generate embedding for batch entry
+		embedding, err := candle_binding.GetEmbedding(query, 0)
+		if err != nil {
+			metrics.RecordCacheOperation("milvus", "add_entry", "error", time.Since(start).Seconds())
+			return fmt.Errorf("failed to generate embedding: %w", err)
+		}
 
+		// Create cache entry for batch
+		entry := &CacheEntry{
+			RequestBody:  requestBody,
+			ResponseBody: responseBody,
+			Model:        model,
+			Query:        query,
+			Embedding:    embedding,
+			Timestamp:    time.Now(),
+		}
+
+		// Add to batch buffer
+		err = c.addToBatch(entry)
+		if err != nil {
+			metrics.RecordCacheOperation("milvus", "add_entry", "error", time.Since(start).Seconds())
+			return err
+		}
+
+		c.updateWriteMetrics(time.Since(start), true)
+		metrics.RecordCacheOperation("milvus", "add_entry", "success", time.Since(start).Seconds())
+		return nil
+	}
+
+	// Fallback to single write
+	_, err := c.addEntry(model, query, requestBody, responseBody)
 	if err != nil {
 		metrics.RecordCacheOperation("milvus", "add_entry", "error", time.Since(start).Seconds())
 	} else {
+		c.updateWriteMetrics(time.Since(start), false)
 		metrics.RecordCacheOperation("milvus", "add_entry", "success", time.Since(start).Seconds())
 	}
 
@@ -445,7 +705,13 @@ func (c *MilvusCache) addEntry(model string, query string, requestBody, response
 	// Generate unique ID
 	id := fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%s_%s_%d", model, query, time.Now().UnixNano()))))
 
-	ctx := context.Background()
+	// Create context with timeout for the insert operation
+	timeout := time.Duration(c.config.Connection.Timeout) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Second // Default timeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 
 	// Prepare data for insertion
 	ids := []string{id}
@@ -465,18 +731,32 @@ func (c *MilvusCache) addEntry(model string, query string, requestBody, response
 	embeddingColumn := entity.NewColumnFloatVector(c.config.Collection.VectorField.Name, len(embedding), embeddings)
 	timestampColumn := entity.NewColumnInt64("timestamp", timestamps)
 
-	// Insert the entry into the collection
+	// Insert the entry into the collection with retry logic
 	observability.Debugf("MilvusCache.addEntry: inserting entry into collection '%s' (embedding_dim: %d, request_size: %d, response_size: %d)",
 		c.collectionName, len(embedding), len(requestBody), len(responseBody))
-	_, err = c.client.Insert(ctx, c.collectionName, "", idColumn, modelColumn, queryColumn, requestColumn, responseColumn, embeddingColumn, timestampColumn)
-	if err != nil {
-		observability.Debugf("MilvusCache.addEntry: insert failed: %v", err)
-		return "", fmt.Errorf("failed to insert cache entry: %w", err)
+
+	insertErr := c.retryOperation(ctx, func() error {
+		_, err := c.client.Insert(ctx, c.collectionName, "", idColumn, modelColumn, queryColumn, requestColumn, responseColumn, embeddingColumn, timestampColumn)
+		return err
+	}, "insert cache entry")
+
+	if insertErr != nil {
+		if c.isContextError(insertErr) {
+			observability.Debugf("MilvusCache.addEntry: insert timeout/cancelled: %v", insertErr)
+		} else {
+			observability.Warnf("MilvusCache.addEntry: insert failed after retries: %v", insertErr)
+		}
+		return "", fmt.Errorf("failed to insert cache entry: %w", insertErr)
 	}
 
-	// Ensure data is persisted to storage
-	if err := c.client.Flush(ctx, c.collectionName, false); err != nil {
-		observability.Warnf("Failed to flush cache entry: %v", err)
+	// Ensure data is persisted to storage (with shorter timeout for flush)
+	flushCtx, flushCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer flushCancel()
+
+	if err := c.client.Flush(flushCtx, c.collectionName, false); err != nil {
+		if !c.isContextError(err) {
+			observability.Warnf("Failed to flush cache entry: %v", err)
+		}
 	}
 
 	observability.Debugf("MilvusCache.addEntry: successfully added entry to Milvus")
@@ -490,7 +770,7 @@ func (c *MilvusCache) addEntry(model string, query string, requestBody, response
 	return query, nil
 }
 
-// FindSimilar searches for semantically similar cached requests
+// FindSimilar searches for semantically similar cached requests using native vector search
 func (c *MilvusCache) FindSimilar(model string, query string) ([]byte, bool, error) {
 	start := time.Now()
 
@@ -512,94 +792,133 @@ func (c *MilvusCache) FindSimilar(model string, query string) ([]byte, bool, err
 		return nil, false, fmt.Errorf("failed to generate embedding: %w", err)
 	}
 
-	ctx := context.Background()
+	// Create context with timeout for the search operation
+	timeout := time.Duration(c.config.Connection.Timeout) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Second // Default timeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 
-	// Query for completed entries with the same model
-	// Using Query approach for comprehensive similarity search
-	queryExpr := fmt.Sprintf("model == \"%s\" && response_body != \"\"", model)
-	observability.Debugf("MilvusCache.FindSimilar: querying with expr: %s (embedding_dim: %d)",
-		queryExpr, len(queryEmbedding))
-
-	// Use Query to get all matching entries, then compute similarity manually
-	results, err := c.client.Query(ctx, c.collectionName, []string{}, queryExpr,
-		[]string{"query", "response_body", c.config.Collection.VectorField.Name})
-
+	// Create vector search parameters
+	searchParam, err := entity.NewIndexHNSWSearchParam(c.config.Search.Params.Ef)
 	if err != nil {
-		observability.Debugf("MilvusCache.FindSimilar: query failed: %v", err)
 		atomic.AddInt64(&c.missCount, 1)
 		metrics.RecordCacheOperation("milvus", "find_similar", "error", time.Since(start).Seconds())
 		metrics.RecordCacheMiss()
-		return nil, false, nil
+		return nil, false, fmt.Errorf("failed to create search param: %w", err)
 	}
 
-	if len(results) == 0 {
+	// Create search vector
+	searchVector := entity.FloatVector(queryEmbedding)
+
+	// Set up output fields to retrieve
+	outputFields := []string{"response_body", "query", "model"}
+
+	// Create filter expression for the model and non-empty responses
+	filterExpr := fmt.Sprintf("model == \"%s\" && response_body != \"\"", model)
+	observability.Debugf("MilvusCache.FindSimilar: vector search with expr: %s, topk=%d, ef=%d (embedding_dim: %d)",
+		filterExpr, c.config.Search.TopK, c.config.Search.Params.Ef, len(queryEmbedding))
+
+	// Perform vector search with retry logic
+	var searchResults []client.SearchResult
+	var searchErr error
+
+	searchErr = c.retryOperation(ctx, func() error {
+		results, err := c.client.Search(
+			ctx,
+			c.collectionName,
+			[]string{}, // partition names (empty means search all partitions)
+			filterExpr,
+			outputFields,
+			[]entity.Vector{searchVector},
+			c.config.Collection.VectorField.Name,
+			entity.L2, // metric type
+			c.config.Search.TopK,
+			searchParam,
+		)
+		if err != nil {
+			return err
+		}
+		searchResults = results
+		return nil
+	}, "vector search")
+
+	if searchErr != nil {
+		if c.isContextError(searchErr) {
+			observability.Debugf("MilvusCache.FindSimilar: search timeout/cancelled: %v", searchErr)
+		} else {
+			observability.Warnf("MilvusCache.FindSimilar: vector search failed after retries: %v", searchErr)
+		}
 		atomic.AddInt64(&c.missCount, 1)
-		observability.Debugf("MilvusCache.FindSimilar: no entries found with responses")
+		metrics.RecordCacheOperation("milvus", "find_similar", "error", time.Since(start).Seconds())
+		metrics.RecordCacheMiss()
+		return nil, false, fmt.Errorf("vector search failed: %w", searchErr)
+	}
+
+	// Check if we got any results
+	if len(searchResults) == 0 || searchResults[0].IDs.Len() == 0 {
+		atomic.AddInt64(&c.missCount, 1)
+		observability.Debugf("MilvusCache.FindSimilar: no similar entries found via vector search")
 		metrics.RecordCacheOperation("milvus", "find_similar", "miss", time.Since(start).Seconds())
 		metrics.RecordCacheMiss()
 		return nil, false, nil
 	}
 
-	// Calculate semantic similarity for each candidate
+	// Process search results
 	bestSimilarity := float32(-1.0)
 	var bestResponse string
+	entriesChecked := 0
 
-	// Find columns by type instead of assuming order
-	var queryColumn *entity.ColumnVarChar
-	var responseColumn *entity.ColumnVarChar
-	var embeddingColumn *entity.ColumnFloatVector
+	// Iterate through search results to find the best match above threshold
+	for _, result := range searchResults {
+		for i := 0; i < result.IDs.Len(); i++ {
+			entriesChecked++
 
-	for _, col := range results {
-		switch typedCol := col.(type) {
-		case *entity.ColumnVarChar:
-			if typedCol.Name() == "query" {
-				queryColumn = typedCol
-			} else if typedCol.Name() == "response_body" {
-				responseColumn = typedCol
+			// Get similarity score (distance) - for IP metric, higher is better
+			similarity := float32(0.0)
+			if result.Scores != nil && i < len(result.Scores) {
+				// For IP (Inner Product) metric, scores are already similarity values
+				similarity = result.Scores[i]
 			}
-		case *entity.ColumnFloatVector:
-			if typedCol.Name() == c.config.Collection.VectorField.Name {
-				embeddingColumn = typedCol
+
+			// Get response body
+			var responseBody string
+			for _, field := range result.Fields {
+				if field.Name() == "response_body" {
+					if column, ok := field.(*entity.ColumnVarChar); ok {
+						responseBody = column.Data()[i]
+					}
+					break
+				}
 			}
-		}
-	}
 
-	if queryColumn == nil || responseColumn == nil || embeddingColumn == nil {
-		observability.Debugf("MilvusCache.FindSimilar: missing required columns in results")
-		atomic.AddInt64(&c.missCount, 1)
-		metrics.RecordCacheOperation("milvus", "find_similar", "error", time.Since(start).Seconds())
-		metrics.RecordCacheMiss()
-		return nil, false, nil
-	}
+			observability.Debugf("MilvusCache.FindSimilar: result %d - similarity=%.4f, response_size=%d",
+				i+1, similarity, len(responseBody))
 
-	for i := 0; i < queryColumn.Len(); i++ {
-		storedEmbedding := embeddingColumn.Data()[i]
-
-		// Calculate dot product similarity score
-		var similarity float32
-		for j := 0; j < len(queryEmbedding) && j < len(storedEmbedding); j++ {
-			similarity += queryEmbedding[j] * storedEmbedding[j]
-		}
-
-		if similarity > bestSimilarity {
-			bestSimilarity = similarity
-			bestResponse = responseColumn.Data()[i]
+			// Update best match if this result has higher similarity
+			if similarity > bestSimilarity && similarity >= c.similarityThreshold {
+				bestSimilarity = similarity
+				bestResponse = responseBody
+			}
 		}
 	}
 
 	observability.Debugf("MilvusCache.FindSimilar: best similarity=%.4f, threshold=%.4f (checked %d entries)",
-		bestSimilarity, c.similarityThreshold, queryColumn.Len())
+		bestSimilarity, c.similarityThreshold, entriesChecked)
 
-	if bestSimilarity >= c.similarityThreshold {
+	if bestSimilarity >= c.similarityThreshold && bestResponse != "" {
 		atomic.AddInt64(&c.hitCount, 1)
 		observability.Debugf("MilvusCache.FindSimilar: CACHE HIT - similarity=%.4f >= threshold=%.4f, response_size=%d bytes",
 			bestSimilarity, c.similarityThreshold, len(bestResponse))
 		observability.LogEvent("cache_hit", map[string]interface{}{
-			"backend":    "milvus",
-			"similarity": bestSimilarity,
-			"threshold":  c.similarityThreshold,
-			"model":      model,
-			"collection": c.collectionName,
+			"backend":       "milvus",
+			"similarity":    bestSimilarity,
+			"threshold":     c.similarityThreshold,
+			"model":         model,
+			"collection":    c.collectionName,
+			"search_method": "vector_search",
+			"entries_found": entriesChecked,
 		})
 		metrics.RecordCacheOperation("milvus", "find_similar", "hit", time.Since(start).Seconds())
 		metrics.RecordCacheHit()
@@ -615,7 +934,8 @@ func (c *MilvusCache) FindSimilar(model string, query string) ([]byte, bool, err
 		"threshold":       c.similarityThreshold,
 		"model":           model,
 		"collection":      c.collectionName,
-		"entries_checked": queryColumn.Len(),
+		"search_method":   "vector_search",
+		"entries_checked": entriesChecked,
 	})
 	metrics.RecordCacheOperation("milvus", "find_similar", "miss", time.Since(start).Seconds())
 	metrics.RecordCacheMiss()
@@ -624,8 +944,18 @@ func (c *MilvusCache) FindSimilar(model string, query string) ([]byte, bool, err
 
 // Close releases all resources held by the cache
 func (c *MilvusCache) Close() error {
+	// Stop TTL cleanup goroutine if running
+	c.stopTTLCleanup()
+
+	// Close Milvus client
 	if c.client != nil {
-		return c.client.Close()
+		observability.Debugf("MilvusCache: closing Milvus client connection")
+		err := c.client.Close()
+		if err != nil {
+			observability.Warnf("Failed to close Milvus client: %v", err)
+			return err
+		}
+		observability.Debugf("MilvusCache: Milvus client connection closed")
 	}
 	return nil
 }
@@ -673,4 +1003,334 @@ func (c *MilvusCache) GetStats() CacheStats {
 	}
 
 	return cacheStats
+}
+
+// startTTLCleanup starts a background goroutine to clean up expired entries
+func (c *MilvusCache) startTTLCleanup() {
+	c.cleanupWG.Add(1)
+	go func() {
+		defer c.cleanupWG.Done()
+
+		// Calculate ticker interval from config
+		interval := time.Duration(c.config.DataManagement.TTL.CleanupInterval) * time.Second
+		if interval <= 0 {
+			interval = time.Hour // Default to 1 hour
+		}
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		observability.Infof("MilvusCache TTL cleanup started - interval: %v, TTL: %ds", interval, c.ttlSeconds)
+
+		for {
+			select {
+			case <-ticker.C:
+				c.performTTLCleanup()
+			case <-c.cleanupStopChan:
+				observability.Infof("MilvusCache TTL cleanup stopped")
+				return
+			}
+		}
+	}()
+}
+
+// performTTLCleanup removes expired entries from the cache
+func (c *MilvusCache) performTTLCleanup() {
+	if c.ttlSeconds <= 0 {
+		return // TTL not configured
+	}
+
+	ctx := context.Background()
+	start := time.Now()
+
+	// Calculate cutoff time
+	cutoffTime := time.Now().Add(-time.Duration(c.ttlSeconds) * time.Second).Unix()
+	observability.Debugf("MilvusCache.performTTLCleanup: removing entries older than %d (timestamp < %d)",
+		c.ttlSeconds, cutoffTime)
+
+	// Create expression to delete expired entries
+	deleteExpr := fmt.Sprintf("timestamp < %d", cutoffTime)
+
+	// Execute deletion
+	err := c.client.Delete(ctx, c.collectionName, "", deleteExpr)
+	if err != nil {
+		observability.Warnf("MilvusCache TTL cleanup failed: %v", err)
+		return
+	}
+
+	// Update last cleanup time
+	cleanupTime := time.Now()
+	c.mu.Lock()
+	c.lastCleanupTime = &cleanupTime
+	c.mu.Unlock()
+
+	observability.Infof("MilvusCache TTL cleanup completed in %v", time.Since(start))
+	observability.LogEvent("ttl_cleanup_completed", map[string]interface{}{
+		"backend":          "milvus",
+		"cleanup_time":     time.Since(start).String(),
+		"ttl_seconds":      c.ttlSeconds,
+		"cutoff_timestamp": cutoffTime,
+	})
+
+	// Flush changes to ensure persistence
+	if err := c.client.Flush(ctx, c.collectionName, false); err != nil {
+		observability.Warnf("Failed to flush after TTL cleanup: %v", err)
+	}
+}
+
+// stopTTLCleanup gracefully stops the TTL cleanup and batch writer goroutines
+func (c *MilvusCache) stopTTLCleanup() {
+	if c.cleanupStopChan != nil {
+		observability.Debugf("MilvusCache: stopping background goroutines")
+		close(c.cleanupStopChan)
+		c.cleanupWG.Wait()
+		observability.Debugf("MilvusCache: background goroutines stopped")
+	}
+}
+
+// retryOperation executes a function with retry logic for transient errors
+func (c *MilvusCache) retryOperation(ctx context.Context, operation func() error, operationName string) error {
+	const maxRetries = 3
+	const baseDelay = 100 * time.Millisecond
+
+	var lastErr error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			// Check context before retry
+			if ctx.Err() != nil {
+				return fmt.Errorf("context cancelled during %s: %w", operationName, ctx.Err())
+			}
+
+			// Exponential backoff
+			delay := baseDelay * time.Duration(1<<uint(attempt-1))
+			observability.Debugf("MilvusCache: retrying %s (attempt %d/%d) after %v",
+				operationName, attempt+1, maxRetries, delay)
+
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return fmt.Errorf("context cancelled during %s retry delay: %w", operationName, ctx.Err())
+			}
+		}
+
+		err := operation()
+		if err == nil {
+			return nil // Success
+		}
+
+		lastErr = err
+
+		// Don't retry on certain errors
+		if c.isNonRetryableError(err) {
+			observability.Warnf("MilvusCache: non-retryable error in %s: %v", operationName, err)
+			return err
+		}
+
+		observability.Warnf("MilvusCache: %s failed (attempt %d/%d): %v",
+			operationName, attempt+1, maxRetries, err)
+	}
+
+	return fmt.Errorf("%s failed after %d attempts, last error: %w", operationName, maxRetries, lastErr)
+}
+
+// isNonRetryableError determines if an error should not be retried
+func (c *MilvusCache) isNonRetryableError(err error) bool {
+	errStr := err.Error()
+
+	// Don't retry authentication errors
+	if strings.Contains(errStr, "authentication") ||
+		strings.Contains(errStr, "unauthorized") ||
+		strings.Contains(errStr, "access denied") {
+		return true
+	}
+
+	// Don't retry collection not found errors
+	if strings.Contains(errStr, "collection not found") ||
+		strings.Contains(errStr, "does not exist") {
+		return true
+	}
+
+	// Don't retry invalid configuration errors
+	if strings.Contains(errStr, "invalid configuration") ||
+		strings.Contains(errStr, "invalid parameter") ||
+		strings.Contains(errStr, "dimension mismatch") {
+		return true
+	}
+
+	return false
+}
+
+// isContextError checks if the error is context-related
+func (c *MilvusCache) isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		strings.Contains(err.Error(), "context canceled") ||
+		strings.Contains(err.Error(), "deadline exceeded")
+}
+
+// startBatchWriter starts the batch write goroutine
+func (c *MilvusCache) startBatchWriter() {
+	c.batchTimer = time.NewTimer(time.Duration(c.config.Performance.Batch.Timeout) * time.Second)
+
+	go func() {
+		for {
+			select {
+			case <-c.batchTimer.C:
+				c.flushBatch()
+			case <-c.cleanupStopChan:
+				c.flushBatch() // Flush remaining entries before stopping
+				if c.batchTimer != nil {
+					c.batchTimer.Stop()
+				}
+				return
+			}
+		}
+	}()
+
+	observability.Debugf("MilvusCache: batch writer started with timeout %ds", c.config.Performance.Batch.Timeout)
+}
+
+// addToBatch adds an entry to the batch buffer
+func (c *MilvusCache) addToBatch(entry *CacheEntry) error {
+	c.batchMu.Lock()
+	defer c.batchMu.Unlock()
+
+	c.batchBuffer = append(c.batchBuffer, entry)
+
+	// If batch is full, flush immediately
+	if len(c.batchBuffer) >= c.config.Performance.Batch.InsertBatchSize {
+		go c.flushBatch()
+	} else if c.batchTimer != nil {
+		// Reset timer to extend the batch window
+		c.batchTimer.Reset(time.Duration(c.config.Performance.Batch.Timeout) * time.Second)
+	}
+
+	return nil
+}
+
+// flushBatch writes all buffered entries to Milvus
+func (c *MilvusCache) flushBatch() {
+	c.batchMu.Lock()
+	if len(c.batchBuffer) == 0 {
+		c.batchMu.Unlock()
+		return
+	}
+
+	// Copy buffer and clear it
+	entries := make([]*CacheEntry, len(c.batchBuffer))
+	copy(entries, c.batchBuffer)
+	c.batchBuffer = c.batchBuffer[:0]
+	c.batchMu.Unlock()
+
+	if len(entries) == 0 {
+		return
+	}
+
+	start := time.Now()
+	observability.Debugf("MilvusCache: flushing batch of %d entries", len(entries))
+
+	// Prepare batch data
+	ids := make([]string, len(entries))
+	models := make([]string, len(entries))
+	queries := make([]string, len(entries))
+	requestBodies := make([]string, len(entries))
+	responseBodies := make([]string, len(entries))
+	embeddings := make([][]float32, len(entries))
+	timestamps := make([]int64, len(entries))
+
+	for i, entry := range entries {
+		ids[i] = fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%s_%s_%d_%d",
+			entry.Model, entry.Query, entry.Timestamp.UnixNano(), i))))
+		models[i] = entry.Model
+		queries[i] = entry.Query
+		requestBodies[i] = string(entry.RequestBody)
+		responseBodies[i] = string(entry.ResponseBody)
+		embeddings[i] = entry.Embedding
+		timestamps[i] = entry.Timestamp.Unix()
+	}
+
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Create columns
+	idColumn := entity.NewColumnVarChar("id", ids)
+	modelColumn := entity.NewColumnVarChar("model", models)
+	queryColumn := entity.NewColumnVarChar("query", queries)
+	requestColumn := entity.NewColumnVarChar("request_body", requestBodies)
+	responseColumn := entity.NewColumnVarChar("response_body", responseBodies)
+	embeddingColumn := entity.NewColumnFloatVector(c.config.Collection.VectorField.Name, len(embeddings[0]), embeddings)
+	timestampColumn := entity.NewColumnInt64("timestamp", timestamps)
+
+	// Insert batch with retry logic
+	err := c.retryOperation(ctx, func() error {
+		_, err := c.client.Insert(ctx, c.collectionName, "",
+			idColumn, modelColumn, queryColumn, requestColumn, responseColumn, embeddingColumn, timestampColumn)
+		return err
+	}, "batch insert")
+
+	// Update metrics
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.writeMetrics.totalWrites += int64(len(entries))
+
+	if err != nil {
+		c.writeMetrics.writeErrors += int64(len(entries))
+		observability.Warnf("MilvusCache: batch insert failed for %d entries: %v", len(entries), err)
+	} else {
+		c.writeMetrics.batchWrites += int64(len(entries))
+		c.writeMetrics.avgWriteLatency = (c.writeMetrics.avgWriteLatency*float64(c.writeMetrics.batchWrites-1) +
+			time.Since(start).Seconds()) / float64(c.writeMetrics.batchWrites)
+		c.writeMetrics.lastWriteTime = time.Now()
+
+		observability.Debugf("MilvusCache: batch insert completed - %d entries in %v",
+			len(entries), time.Since(start))
+		observability.LogEvent("batch_insert_completed", map[string]interface{}{
+			"backend":     "milvus",
+			"batch_size":  len(entries),
+			"duration":    time.Since(start).String(),
+			"avg_latency": time.Since(start).Seconds() / float64(len(entries)),
+		})
+
+		// Flush to ensure persistence
+		if flushErr := c.client.Flush(ctx, c.collectionName, false); flushErr != nil {
+			observability.Warnf("Failed to flush after batch insert: %v", flushErr)
+		}
+	}
+}
+
+// getPerformanceMetrics returns performance metrics for the cache
+func (c *MilvusCache) getPerformanceMetrics() map[string]interface{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return map[string]interface{}{
+		"total_writes":      c.writeMetrics.totalWrites,
+		"batch_writes":      c.writeMetrics.batchWrites,
+		"single_writes":     c.writeMetrics.singleWrites,
+		"write_errors":      c.writeMetrics.writeErrors,
+		"avg_write_latency": c.writeMetrics.avgWriteLatency,
+		"last_write_time":   c.writeMetrics.lastWriteTime,
+		"batch_buffer_size": len(c.batchBuffer),
+		"max_batch_size":    c.config.Performance.Batch.InsertBatchSize,
+	}
+}
+
+// updateWriteMetrics updates write performance metrics
+func (c *MilvusCache) updateWriteMetrics(duration time.Duration, isBatch bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.writeMetrics.totalWrites++
+	if isBatch {
+		c.writeMetrics.batchWrites++
+	} else {
+		c.writeMetrics.singleWrites++
+	}
+
+	c.writeMetrics.avgWriteLatency = (c.writeMetrics.avgWriteLatency*float64(c.writeMetrics.totalWrites-1) +
+		duration.Seconds()) / float64(c.writeMetrics.totalWrites)
+	c.writeMetrics.lastWriteTime = time.Now()
 }
